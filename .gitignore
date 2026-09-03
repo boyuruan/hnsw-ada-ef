@@ -16,3 +16,6 @@ cmake-build-debug/
 experiments/
 !benchmarking-darth/experiments/
 .venv
+
+.agents/
+.claude/
