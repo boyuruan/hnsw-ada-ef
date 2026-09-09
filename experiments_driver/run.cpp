@@ -1,4 +1,4 @@
-#include "util.h"
+#include "hdf5_io.h"
 #include "../hnswlib/adaptive_ef.h"
 #include <algorithm>
 #include <filesystem>
@@ -54,58 +54,6 @@ void setup_laion_text2image(std::shared_ptr<hnswlib::HierarchicalNSW<float>> &hn
     std::cout << "Data size of space:" << space->get_data_size() << std::endl;
 }
 
-void run_online_search(
-    const std::string &dataset,
-    float quantile_step,
-    int k,
-    std::shared_ptr<hnswlib::HierarchicalNSW<float>> hnsw,
-    std::shared_ptr<hnswdis::MatrixXf> query,
-    std::shared_ptr<hnswdis::MatrixXf> data,
-    std::shared_ptr<hnswdis::MatrixXi> ground_truth)
-{
-    float expected_recall = 0.95;
-    int ef_upper_bound = 5000;
-    int repeat = 1;
-
-    std::string ef_adaptor_path = (root / "estimation_table" / (dataset + "-ef_adaptor-" + "-k" + std::to_string(k) + "-ef.bin")).string();
-    std::string estimator_path = (root / "statistics" / (dataset + "-estimator-" + "-k-" + std::to_string(k) + ".bin")).string();
-
-    if (dataset == "laion_text")
-    {
-        estimator_path = (root / "statistics" / ("laion_image-estimator--k-" + std::to_string(k) + ".bin")).string();
-    }
-
-    if (!std::filesystem::exists(estimator_path))
-    {
-        throw std::runtime_error("Missing estimator file: " + estimator_path);
-    }
-    if (!std::filesystem::exists(ef_adaptor_path))
-    {
-        throw std::runtime_error("Missing ef adaptor file: " + ef_adaptor_path);
-    }
-
-    std::shared_ptr<hnswdis::Estimator> estimator;
-    estimator = hnswdis::load_estimator_from_file(estimator_path);
-    hnswdis::ApproximatedScoreCalculator score_cal(estimator, quantile_step);
-
-    std::shared_ptr<hnswdis::EfAdapter> ef_adapter_ptr;
-    hnswdis::EfAdapter ef_adapter(ef_adaptor_path);
-    ef_adapter_ptr = std::make_shared<hnswdis::EfAdapter>(ef_adapter);
-
-    hnswdis::Sketch sketch(
-        ef_adapter_ptr->get_ef_recall_estimators(),
-        expected_recall);
-    const float wae = ef_adapter_ptr->get_wae();
-    std::cout << "****Weighted average ef: " << (size_t)wae << std::endl;
-    size_t statics_length = 1 + 32 + 31 * 32; // 2-hop neighbors on the base layer: M = 16
-    hnsw->setEf(wae);
-    adaptive_search(dataset, repeat, *hnsw, *query, *data, *ground_truth, score_cal, k, sketch, statics_length, expected_recall);
-    adaptive_ef_analysis(dataset, *hnsw, *query, score_cal, k, sketch, statics_length);
-
-    search_with_patience_in_proximity(dataset, repeat, *hnsw, *query, *ground_truth, k);
-    baseline_search(dataset, repeat, *hnsw, *query, *ground_truth, k, ef_upper_bound);
-}
-
 void online_exp()
 {
     std::cout << "Starting adaptive ef tests...\n\n"
@@ -150,7 +98,7 @@ void online_exp()
             space = std::get<4>(tuple);
         }
 
-        run_online_search(dataset, quantile_step, k, hnsw, query, data, ground_truth);
+        run_online_search(root, dataset, quantile_step, k, hnsw, query, data, ground_truth);
     }
 }
 
@@ -1441,29 +1389,10 @@ void per_query_result_exp()
     }
 }
 
-void print_usage()
+int main()
 {
-    std::cerr
-        << "Usage:\n"
-        << "  run\n"
-        << "  run build --base BASE.fvecs --index OUT.hnsw [--metric l2|cd] [--M 16] [--efc 500] [--threads N]\n"
-        << "  run online --base BASE.fvecs --query QUERY.fvecs --neighbors GT.ivecs --index INDEX.hnsw\n"
-        << "             --dataset NAME [--metric l2|cd] [--k 100] [--quantile-step 1e-3]\n";
-}
-
-bool require_flag(const std::string &name, const std::string &value)
-{
-    if (!value.empty())
-    {
-        return true;
-    }
-    std::cerr << "Missing required flag: " << name << std::endl;
-    print_usage();
-    return false;
-}
-
-int require_experiments_root()
-{
+    std::cout << "Starting experiments for Ada-ef hnswdis library...\n\n"
+              << std::endl;
     char *root_path = std::getenv("EXPERIMENTS_ROOT");
     if (root_path == nullptr)
     {
@@ -1473,147 +1402,21 @@ int require_experiments_root()
         return 1;
     }
     std::cout << "EXPERIMENTS_ROOT: " << root_path << std::endl;
-    return 0;
-}
-
-int run_legacy_experiments()
-{
-    std::cout << "Starting experiments for Ada-ef hnswdis library...\n\n"
-              << std::endl;
-    if (require_experiments_root() != 0)
-    {
-        return 1;
-    }
 
     // indexing_exp(); // indexes are precomputed, uncomment to run if needed
     // functions for computing groundtruth: compute_groundtruth_laion_text2image and compute_and_save_gound_truth
 
-    offline_exp();          // offline computation of estimator, samplings, and ef-adaptor
-    online_exp();           // onine search experiments
-    sensitivity_analysis(); // sensitivity analysis for estimator parameters, including k and recall target
+    offline_exp();
+    online_exp();
+    sensitivity_analysis();
 
-    insert_exp(true); // insert experiment with setup
-    delete_exp(true); // delete experiment with setup
+    insert_exp(true);
+    delete_exp(true);
 
-    ablation_study_distance_list_size();      // ablation study on distance list size
-    ablation_study_sampling_size();           // ablation study on sampling size
-    ablation_study_weighted_decay_function(); // ablation study on weighted decay functions
+    ablation_study_distance_list_size();
+    ablation_study_sampling_size();
+    ablation_study_weighted_decay_function();
 
-    per_query_result_exp(); // per-query result experiments
+    per_query_result_exp();
     return 0;
-}
-
-int main(int argc, char **argv)
-{
-    if (argc <= 1)
-    {
-        return run_legacy_experiments();
-    }
-
-    const std::string cmd = argv[1];
-    if (cmd == "-h" || cmd == "--help" || cmd == "help")
-    {
-        print_usage();
-        return 0;
-    }
-
-    std::string base, query, neighbors, index_path, metric = "l2", dataset;
-    int M = 16;
-    int efc = 500;
-    int threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency() / 4));
-    int k = 100;
-    float quantile_step = 1e-3f;
-
-    try
-    {
-        for (int i = 2; i < argc; ++i)
-        {
-            const std::string flag = argv[i];
-            auto take = [&](std::string &out)
-            {
-                if (i + 1 >= argc)
-                {
-                    throw std::runtime_error("Missing value for " + flag);
-                }
-                out = argv[++i];
-            };
-            auto take_int = [&](int &out)
-            {
-                std::string raw;
-                take(raw);
-                out = std::stoi(raw);
-            };
-            auto take_float = [&](float &out)
-            {
-                std::string raw;
-                take(raw);
-                out = std::stof(raw);
-            };
-
-            if (flag == "--base")
-                take(base);
-            else if (flag == "--query")
-                take(query);
-            else if (flag == "--neighbors")
-                take(neighbors);
-            else if (flag == "--index")
-                take(index_path);
-            else if (flag == "--metric")
-                take(metric);
-            else if (flag == "--dataset")
-                take(dataset);
-            else if (flag == "--M")
-                take_int(M);
-            else if (flag == "--efc")
-                take_int(efc);
-            else if (flag == "--threads")
-                take_int(threads);
-            else if (flag == "--k")
-                take_int(k);
-            else if (flag == "--quantile-step")
-                take_float(quantile_step);
-            else
-            {
-                std::cerr << "Unknown flag: " << flag << std::endl;
-                print_usage();
-                return 1;
-            }
-        }
-
-        if (cmd == "build")
-        {
-            if (!require_flag("--base", base) || !require_flag("--index", index_path))
-            {
-                return 1;
-            }
-            build_index_from_fvecs(base, index_path, M, efc, metric, threads);
-            return 0;
-        }
-        if (cmd == "online")
-        {
-            if (!require_flag("--base", base) || !require_flag("--query", query) ||
-                !require_flag("--neighbors", neighbors) || !require_flag("--index", index_path) ||
-                !require_flag("--dataset", dataset))
-            {
-                return 1;
-            }
-            if (require_experiments_root() != 0)
-            {
-                return 1;
-            }
-            auto tuple = load_index_and_data_fvecs(base, query, neighbors, index_path, metric);
-            run_online_search(dataset, quantile_step, k,
-                              std::get<0>(tuple), std::get<1>(tuple), std::get<2>(tuple), std::get<3>(tuple));
-            return 0;
-        }
-
-        std::cerr << "Unknown command: " << cmd << std::endl;
-        print_usage();
-        return 1;
-    }
-    catch (const std::exception &e)
-    {
-        std::cerr << e.what() << std::endl;
-        return 1;
-    }
 }

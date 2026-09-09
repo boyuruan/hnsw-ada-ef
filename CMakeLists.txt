@@ -17,6 +17,12 @@ target_include_directories(boost INTERFACE ${BOOST_ROOT})
 set(HDF5_INCLUDE_DIR "/usr/include/hdf5/serial")
 set(HDF5_LIB_DIR "/usr/lib/x86_64-linux-gnu/hdf5/serial")
 
+option(HNSWLIB_WITH_HDF5 "Build the HDF5 experiments binary `run`" ON)
+if(HNSWLIB_WITH_HDF5 AND NOT EXISTS "${HDF5_INCLUDE_DIR}/H5Cpp.h")
+    message(WARNING "HDF5 C++ headers not found at ${HDF5_INCLUDE_DIR}; building without `run`. Pass -DHNSWLIB_WITH_HDF5=OFF to silence this.")
+    set(HNSWLIB_WITH_HDF5 OFF)
+endif()
+
 add_library(hnswlib INTERFACE)
 add_library(hnswlib::hnswlib ALIAS hnswlib)
 
@@ -122,18 +128,22 @@ if(HNSWLIB_EXAMPLES)
     # target_link_libraries(main hnswlib)
 endif()
 
-add_executable(run experiments_driver/run.cpp)
-target_include_directories(run PRIVATE
-    ${HDF5_INCLUDE_DIR}
-)
-# # Link HDF5 libraries
-target_link_libraries(run
-        eigen
-        boost
-        ${HDF5_LIB_DIR}/libhdf5.so
-        ${HDF5_LIB_DIR}/libhdf5_cpp.so
-)
+add_executable(run_fvecs experiments_driver/run_fvecs.cpp)
+target_link_libraries(run_fvecs eigen boost)
+set_target_properties(run_fvecs PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 
 add_executable(fvecs_io_smoke tests/cpp/fvecs_io_smoke.cpp)
 target_include_directories(fvecs_io_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(fvecs_io_smoke PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
+if(HNSWLIB_WITH_HDF5)
+    add_executable(run experiments_driver/run.cpp)
+    target_include_directories(run PRIVATE ${HDF5_INCLUDE_DIR})
+    target_link_libraries(run
+            eigen
+            boost
+            ${HDF5_LIB_DIR}/libhdf5.so
+            ${HDF5_LIB_DIR}/libhdf5_cpp.so
+    )
+    set_target_properties(run PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+endif()
