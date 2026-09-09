@@ -2,6 +2,21 @@
 
 #include <H5Cpp.h>
 #include "../hnswlib/adaptive_ef.h"
+#include "fvecs_io.h"
+#include <algorithm>
+#include <chrono>
+#include <queue>
+#include <stdexcept>
+
+void load_fvecs(const std::string &path, hnswdis::MatrixXf &vectors)
+{
+    load_texmex_vecs<float, hnswdis::MatrixXf>(path, vectors);
+}
+
+void load_ivecs(const std::string &path, hnswdis::MatrixXi &vectors)
+{
+    load_texmex_vecs<int, hnswdis::MatrixXi>(path, vectors);
+}
 
 void load_hdf5(const std::string &path,
                hnswdis::MatrixXf &query_vectors,
@@ -262,6 +277,66 @@ void compute_and_save_gound_truth(const std::string &query_data_path, const std:
     }
 }
 
+void build_index_from_matrix(
+    hnswdis::MatrixXf &data_vectors,
+    const std::string &index_path,
+    const int M,
+    const int ef_construction,
+    const std::string &metric,
+    const int num_threads)
+{
+    const int dim = data_vectors.cols();
+    const int max_elements = data_vectors.rows();
+    if (max_elements <= 0 || dim <= 0)
+    {
+        throw std::runtime_error("Cannot build index from empty data");
+    }
+
+    if (metric == "cd")
+    {
+        normalize_matrix(data_vectors);
+    }
+
+    std::shared_ptr<hnswlib::SpaceInterface<float>> space = hnswdis::init_space(metric, dim);
+    std::shared_ptr<hnswlib::HierarchicalNSW<float>> alg_hnsw =
+        std::make_shared<hnswlib::HierarchicalNSW<float>>(space.get(), max_elements, M, ef_construction);
+
+    auto start = std::chrono::high_resolution_clock::now();
+    hnswdis::ParallelFor(0, max_elements, num_threads, [&](size_t row_id, size_t threadId)
+                         { alg_hnsw->addPoint((void *)(data_vectors.row(row_id).data()), row_id); });
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    std::cout << "Index built in " << duration.count() << " ms" << std::endl;
+
+    const int probe = std::min(1000, max_elements);
+    float correct = 0;
+    for (int i = 0; i < probe; ++i)
+    {
+        std::priority_queue<std::pair<float, hnswlib::labeltype>> result =
+            alg_hnsw->searchKnn(data_vectors.row(i).data(), 1);
+        hnswlib::labeltype label = result.top().second;
+        if (label == i)
+            correct++;
+    }
+    std::cout << "First " << probe << " Data Points Recall: " << correct / probe << "\n";
+
+    if (max_elements > probe)
+    {
+        correct = 0;
+        for (int i = max_elements - probe; i < max_elements; ++i)
+        {
+            std::priority_queue<std::pair<float, hnswlib::labeltype>> result =
+                alg_hnsw->searchKnn(data_vectors.row(i).data(), 1);
+            hnswlib::labeltype label = result.top().second;
+            if (label == i)
+                correct++;
+        }
+        std::cout << "Last " << probe << " Data Points Recall: " << correct / probe << "\n";
+    }
+
+    alg_hnsw->saveIndex(index_path);
+}
+
 void build_index(
     const std::string &hdf5_path,
     const std::string &index_path,
@@ -272,7 +347,6 @@ void build_index(
 {
     hnswdis::MatrixXf query_vectors, data_vectors;
     hnswdis::MatrixXi neighbors;
-    // Load the data
     load_hdf5(hdf5_path, query_vectors, data_vectors, neighbors);
     std::cout << "[Query vectors] rows: " << query_vectors.rows()
               << ", cols: " << query_vectors.cols() << std::endl;
@@ -282,50 +356,23 @@ void build_index(
 
     std::cout << "[Neighbors] rows: " << neighbors.rows()
               << ", cols: " << neighbors.cols() << std::endl;
-    const int dim = data_vectors.cols();          // Dimension of the elements
-    const int max_elements = data_vectors.rows(); // Maximum number of elements, should be known beforehand
 
-    if (metric == "cd")
-    {
-        // normalize the data vectors
-        normalize_matrix(data_vectors);
-    }
+    build_index_from_matrix(data_vectors, index_path, M, ef_construction, metric, num_threads);
+}
 
-    std::shared_ptr<hnswlib::SpaceInterface<float>> space = hnswdis::init_space(metric, dim);
-    std::shared_ptr<hnswlib::HierarchicalNSW<float>> alg_hnsw = std::make_shared<hnswlib::HierarchicalNSW<float>>(space.get(), max_elements, M, ef_construction);
-
-    auto start = std::chrono::high_resolution_clock::now();
-    hnswdis::ParallelFor(0, max_elements, num_threads, [&](size_t row_id, size_t threadId)
-                         { alg_hnsw->addPoint((void *)(data_vectors.row(row_id).data()), row_id); });
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    std::cout << "Index built in " << duration.count() << " ms" << std::endl;
-
-    // Query the fist 1k elements for themselves and measure recall
-    float correct = 0;
-    for (int i = 0; i < 1000; ++i)
-    {
-        std::priority_queue<std::pair<float, hnswlib::labeltype>> result = alg_hnsw->searchKnn(
-            data_vectors.row(i).data(), 1);
-        hnswlib::labeltype label = result.top().second;
-        if (label == i)
-            correct++;
-    }
-    std::cout << "First 1k Data Points Recall: " << correct / 1000 << "\n";
-
-    // Query the last 1k elements for themselves and measure recall
-    correct = 0;
-    for (int i = max_elements - 1000; i < max_elements; ++i)
-    {
-        std::priority_queue<std::pair<float, hnswlib::labeltype>> result = alg_hnsw->searchKnn(
-            data_vectors.row(i).data(), 1);
-        hnswlib::labeltype label = result.top().second;
-        if (label == i)
-            correct++;
-    }
-    std::cout << "Last 1k Data Points Recall: " << correct / 1000 << "\n";
-
-    alg_hnsw->saveIndex(index_path);
+void build_index_from_fvecs(
+    const std::string &base_path,
+    const std::string &index_path,
+    const int M,
+    const int ef_construction,
+    const std::string &metric,
+    const int num_threads)
+{
+    hnswdis::MatrixXf data_vectors;
+    load_fvecs(base_path, data_vectors);
+    std::cout << "[Data vectors]  rows: " << data_vectors.rows()
+              << ", cols: " << data_vectors.cols() << std::endl;
+    build_index_from_matrix(data_vectors, index_path, M, ef_construction, metric, num_threads);
 }
 
 std::tuple<
@@ -357,6 +404,61 @@ load_index_and_data(const std::string &hdf5_path, const std::string &index_path,
     std::shared_ptr<hnswlib::SpaceInterface<float>> space = hnswdis::init_space(metric, query_vectors_ptr->cols());
 
     std::shared_ptr<hnswlib::HierarchicalNSW<float>> alg_hnsw = std::make_shared<hnswlib::HierarchicalNSW<float>>(space.get(), index_path);
+
+    std::cout << "Index loaded" << std::endl;
+
+    std::cout << "Dimension of space:" << *(size_t *)(space->get_dist_func_param()) << std::endl;
+    std::cout << "Data size of space:" << space->get_data_size() << std::endl;
+
+    return std::make_tuple(alg_hnsw, query_vectors_ptr, data_vectors_ptr, neighbors_ptr, space);
+}
+
+std::tuple<
+    std::shared_ptr<hnswlib::HierarchicalNSW<float>>,
+    std::shared_ptr<hnswdis::MatrixXf>,
+    std::shared_ptr<hnswdis::MatrixXf>,
+    std::shared_ptr<hnswdis::MatrixXi>,
+    std::shared_ptr<hnswlib::SpaceInterface<float>>>
+load_index_and_data_fvecs(
+    const std::string &base_path,
+    const std::string &query_path,
+    const std::string &neighbors_path,
+    const std::string &index_path,
+    const std::string &metric)
+{
+    auto query_vectors_ptr = std::make_shared<hnswdis::MatrixXf>();
+    auto data_vectors_ptr = std::make_shared<hnswdis::MatrixXf>();
+    auto neighbors_ptr = std::make_shared<hnswdis::MatrixXi>();
+
+    load_fvecs(base_path, *data_vectors_ptr);
+    load_fvecs(query_path, *query_vectors_ptr);
+    load_ivecs(neighbors_path, *neighbors_ptr);
+
+    if (query_vectors_ptr->rows() != neighbors_ptr->rows())
+    {
+        throw std::runtime_error("Query count does not match neighbors count");
+    }
+    if (query_vectors_ptr->cols() != data_vectors_ptr->cols())
+    {
+        throw std::runtime_error("Query dimension does not match base dimension");
+    }
+
+    if (metric == "cd")
+    {
+        std::cout << "Normalize the data vectors" << std::endl;
+        normalize_matrix(*data_vectors_ptr);
+        normalize_matrix(*query_vectors_ptr);
+    }
+
+    std::cout << "Data vectors dimensions: " << data_vectors_ptr->rows() << " x " << data_vectors_ptr->cols() << std::endl;
+    std::cout << "Query vectors dimensions: " << query_vectors_ptr->rows() << " x " << query_vectors_ptr->cols() << std::endl;
+    std::cout << "Neighbors dimensions: " << neighbors_ptr->rows() << " x " << neighbors_ptr->cols() << std::endl;
+
+    std::shared_ptr<hnswlib::SpaceInterface<float>> space =
+        hnswdis::init_space(metric, query_vectors_ptr->cols());
+
+    std::shared_ptr<hnswlib::HierarchicalNSW<float>> alg_hnsw =
+        std::make_shared<hnswlib::HierarchicalNSW<float>>(space.get(), index_path);
 
     std::cout << "Index loaded" << std::endl;
 
@@ -628,7 +730,7 @@ void adaptive_search_per_query_result(
     }
 
     // === Summary statistics ===
-    double total_latency_seconds = std::accumulate(latencies_ns.begin(), latencies_ns.end(), 0.0) / 1e9;    double avg_latency = std::accumulate(latencies_ns.begin(), latencies_ns.end(), 0.0) / num_queries;
+    double total_latency_seconds = std::accumulate(latencies_ns.begin(), latencies_ns.end(), 0.0) / 1e9;
     double avg_latency = std::accumulate(latencies_ns.begin(), latencies_ns.end(), 0.0) / num_queries;
     double avg_recall = std::accumulate(recalls.begin(), recalls.end(), 0.0) / num_queries;
 

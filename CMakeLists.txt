@@ -6,15 +6,16 @@ project(hnswlib
 include(GNUInstallDirs)
 include(CheckCXXCompilerFlag)
 
-set(EIGEN3_INCLUDE_DIR "/path/to/eigen-3.4.0")
+set(EIGEN3_INCLUDE_DIR "/usr/include/eigen3")
 add_library(eigen INTERFACE)
 target_include_directories(eigen INTERFACE ${EIGEN3_INCLUDE_DIR})
 
-set(BOOST_ROOT "/path/to/boost_1_87_0")
+set(BOOST_ROOT "/usr/include")
 add_library(boost INTERFACE)
 target_include_directories(boost INTERFACE ${BOOST_ROOT})
 
-set(HDF5_ROOT "/path/to/hdf5")
+set(HDF5_INCLUDE_DIR "/usr/include/hdf5/serial")
+set(HDF5_LIB_DIR "/usr/lib/x86_64-linux-gnu/hdf5/serial")
 
 add_library(hnswlib INTERFACE)
 add_library(hnswlib::hnswlib ALIAS hnswlib)
@@ -123,12 +124,16 @@ endif()
 
 add_executable(run experiments_driver/run.cpp)
 target_include_directories(run PRIVATE
-    ${HDF5_ROOT}/include
+    ${HDF5_INCLUDE_DIR}
 )
 # # Link HDF5 libraries
 target_link_libraries(run
         eigen
         boost
-        ${HDF5_ROOT}/lib/libhdf5.so
-        ${HDF5_ROOT}/lib/libhdf5_cpp.so
+        ${HDF5_LIB_DIR}/libhdf5.so
+        ${HDF5_LIB_DIR}/libhdf5_cpp.so
 )
+
+add_executable(fvecs_io_smoke tests/cpp/fvecs_io_smoke.cpp)
+target_include_directories(fvecs_io_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+set_target_properties(fvecs_io_smoke PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
