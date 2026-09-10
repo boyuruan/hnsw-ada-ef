@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -19,6 +20,9 @@ void print_usage()
         << "                    [--k K] [--expected-recall 0.95] [--sampling-size 200] [--ef-upper 5000]\n"
         << "  run_fvecs ada --query QUERY.fvecs --neighbors GT.ivecs --index INDEX.hnsw --dataset NAME\n"
         << "                [--metric l2|cd] [--k 10] [--repeat 3] [--expected-recall 0.95]\n"
+        << "  run_fvecs sweep --query QUERY.fvecs --neighbors GT.ivecs --index INDEX.hnsw\n"
+        << "                  [--metric l2|cd] [--repeat 3] [--ef-min 1000] [--ef-step 1000] [--ef-upper 20000]\n"
+        << "                  (uses min(query rows, GT rows) queries; reports recall@10/100/1000 vs latency)\n"
         << "  run_fvecs online --base BASE.fvecs --query QUERY.fvecs --neighbors GT.ivecs --index INDEX.hnsw\n"
         << "                   --dataset NAME [--metric l2|cd] [--k 100] [--quantile-step 1e-3]\n";
 }
@@ -71,6 +75,7 @@ int main(int argc, char **argv)
     bool k_set = false;
     int repeat = 3;
     int ef_upper = 5000;
+    bool ef_upper_set = false;
     int ef_min = 0;
     int ef_step = 0;
     int sampling_size = 200;
@@ -129,7 +134,10 @@ int main(int argc, char **argv)
             else if (flag == "--repeat")
                 take_int(repeat);
             else if (flag == "--ef-upper")
+            {
                 take_int(ef_upper);
+                ef_upper_set = true;
+            }
             else if (flag == "--ef-min")
                 take_int(ef_min);
             else if (flag == "--ef-step")
@@ -240,6 +248,77 @@ int main(int argc, char **argv)
                       << ", repeat=" << repeat << std::endl;
             run_online_search(std::filesystem::path(std::getenv("EXPERIMENTS_ROOT")), dataset, quantile_step, k,
                               hnsw, query_mat, dummy_ptr, gt, repeat, expected_recall, true);
+            return 0;
+        }
+        if (cmd == "sweep")
+        {
+            if (!require_flag("--query", query) || !require_flag("--neighbors", neighbors) ||
+                !require_flag("--index", index_path))
+            {
+                return 1;
+            }
+            hnswdis::MatrixXf query_mat;
+            hnswdis::MatrixXi gt;
+            load_fvecs(query, query_mat);
+            load_ivecs(neighbors, gt);
+            const size_t num_queries = std::min(query_mat.rows(), gt.rows());
+            std::cout << "Queries used: " << num_queries << " / " << query_mat.rows()
+                      << " (GT rows: " << gt.rows() << ")" << std::endl;
+
+            std::shared_ptr<hnswlib::SpaceInterface<float>> space =
+                hnswdis::init_space(metric, query_mat.cols());
+            hnswlib::HierarchicalNSW<float> hnsw(space.get(), index_path);
+            std::cout << "Index loaded" << std::endl;
+
+            const std::vector<size_t> ks = {10, 100, 1000};
+            const size_t search_k = ks.back();
+            const size_t ef_lo = ef_min > 0 ? static_cast<size_t>(ef_min) : 1000;
+            const size_t ef_st = ef_step > 0 ? static_cast<size_t>(ef_step) : 1000;
+            const size_t ef_hi = ef_upper_set ? static_cast<size_t>(ef_upper) : 20000;
+            if (ef_lo == 0 || ef_st == 0 || ef_lo > ef_hi)
+            {
+                throw std::runtime_error("invalid ef range: need 0 < ef-min <= ef-upper and ef-step > 0");
+            }
+
+            std::cout << "ef, time_ms, recall@10, recall@100, recall@1000" << std::endl;
+            for (size_t ef = ef_lo; ef <= ef_hi; ef += ef_st)
+            {
+                hnsw.setEf(ef);
+                std::vector<int64_t> times;
+                times.reserve(repeat);
+                std::vector<std::vector<size_t>> last_result;
+                for (int r = 0; r < repeat; ++r)
+                {
+                    std::vector<std::vector<size_t>> result;
+                    result.reserve(num_queries);
+                    auto start = std::chrono::high_resolution_clock::now();
+                    for (size_t q = 0; q < num_queries; ++q)
+                    {
+                        auto ret = hnsw.searchKnn(query_mat.row(q).data(), search_k);
+                        size_t count = ret.size();
+                        std::vector<size_t> labels(count);
+                        while (!ret.empty())
+                        {
+                            labels[--count] = ret.top().second;
+                            ret.pop();
+                        }
+                        result.push_back(std::move(labels));
+                    }
+                    auto end = std::chrono::high_resolution_clock::now();
+                    times.push_back(std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+                    last_result = std::move(result);
+                }
+                std::sort(times.begin(), times.end());
+                int64_t med = times[times.size() / 2];
+                std::cout << ef << ", " << med;
+                for (const size_t k : ks)
+                {
+                    auto recalls = hnswdis::compute_recall(gt, last_result, k, false);
+                    float avg = std::accumulate(recalls.begin(), recalls.end(), 0.0f) / recalls.size();
+                    std::cout << ", " << avg;
+                }
+                std::cout << std::endl;
+            }
             return 0;
         }
         if (cmd == "online")
