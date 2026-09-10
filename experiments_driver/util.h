@@ -976,7 +976,7 @@ void run_offline_ada(
         std::cout << "Wrote estimator " << estimator_path << std::endl;
     }
 
-    auto sampling_pair = hnswdis::compute_samplings(data, metric, max_k, static_cast<size_t>(sampling_size), true);
+    auto sampling_pair = hnswdis::compute_samplings(data, metric, max_k, static_cast<size_t>(sampling_size));
     for (int k : ks)
     {
         auto samplings_path = (root / "sampling" / (dataset + "-samplings-" + "-k" + std::to_string(k) + "-ef.bin")).string();

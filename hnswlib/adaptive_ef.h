@@ -2,6 +2,7 @@
 
 #include "distribution.h"
 #include "hnswalg.h"
+#include <cmath>
 #include <thread>
 #include <omp.h>
 
@@ -781,7 +782,7 @@ namespace hnswdis
 
         std::vector<int> indices(sample_size);
 
-        std::uniform_int_distribution<> dis(0, data_vectors.rows());
+        std::uniform_int_distribution<> dis(0, static_cast<int>(data_vectors.rows()) - 1);
         std::unordered_set<int> unique_indices;
         while (unique_indices.size() < sample_size)
         {
@@ -888,40 +889,49 @@ namespace hnswdis
                 recalls.push_back(recalls_ori[i]);
             }
 
-            float average_recall = std::accumulate(recalls.begin(), recalls.end(), 0.0f) / recalls.size();
+            float average_recall = recalls.empty() ? 0.0f : std::accumulate(recalls.begin(), recalls.end(), 0.0f) / recalls.size();
             std::cout << "Average Recall: " << average_recall << std::endl;
 
             std::unordered_map<int, std::vector<float>> grouped_recalls;
             for (size_t i = 0; i < score_list.size(); ++i)
             {
                 int score_key = static_cast<int>(score_list[i]);
-                grouped_recalls[score_key].push_back(recalls[i]);
-
                 score_to_query_map[score_key].push_back(i); // for tracking the score group of queries
+                grouped_recalls[score_key];                 // keep the score key even if all recalls in the group are zero
+                if (recalls_ori[i] >= 1e-3f)
+                {
+                    grouped_recalls[score_key].push_back(recalls_ori[i]);
+                }
             }
 
             // Compute statistics for each score group
             for (auto &[key, value] : grouped_recalls)
             {
-                float sum = std::accumulate(value.begin(), value.end(), 0.0f);
-                float average = sum / value.size();
-
                 size_t size = value.size();
+                float sum = std::accumulate(value.begin(), value.end(), 0.0f);
+                float average = size == 0 ? 0.0f : sum / size;
+
                 std::sort(value.begin(), value.end());
 
                 float median = 0.0f;
-                if (size % 2 == 0)
+                float percentile_25 = 0.0f;
+                float percentile_5 = 0.0f;
+                if (size > 0)
                 {
-                    median = (value[size / 2 - 1] + value[size / 2]) / 2.0f;
+                    if (size % 2 == 0)
+                    {
+                        median = (value[size / 2 - 1] + value[size / 2]) / 2.0f;
+                    }
+                    else
+                    {
+                        median = value[size / 2];
+                    }
+                    percentile_25 = value[static_cast<size_t>(0.25 * size)];
+                    percentile_5 = value[static_cast<size_t>(0.05 * size)];
                 }
-                else
-                {
-                    median = value[size / 2];
-                }
-                float percentile_25 = value[static_cast<size_t>(0.25 * size)];
-                float percentile_5 = value[static_cast<size_t>(0.05 * size)];
 
-                recall_statistics.push_back({key, average, median, percentile_25, percentile_5, value.size()});
+                size_t count = size > 0 ? size : score_to_query_map[key].size();
+                recall_statistics.push_back({key, average, median, percentile_25, percentile_5, count});
             }
 
             // Sort recall_statistics by score
@@ -1298,7 +1308,34 @@ namespace hnswdis
                 {
                     while (expected_recall - latest_agg_recall > 1e-4f) // improve the recall for quries with lower recall
                     {
-                        ef_diff = std::max((int)(ef_diff * (expected_recall - latest_agg_recall) / recall_diff), (int)(k * 0.5));
+                        int min_step = std::max(1, (int)(k * 0.5));
+                        int max_step = std::max(1, ef_upper_bound - latest_ef);
+                        float step_f;
+                        if (std::isfinite(recall_diff) && recall_diff > 0.0f)
+                        {
+                            step_f = static_cast<float>(ef_diff) * (expected_recall - latest_agg_recall) / recall_diff;
+                            if (!std::isfinite(step_f) || step_f < static_cast<float>(min_step))
+                            {
+                                step_f = static_cast<float>(min_step);
+                            }
+                        }
+                        else
+                        {
+                            step_f = static_cast<float>(std::max(ef_diff * 2, min_step));
+                        }
+                        if (!std::isfinite(step_f) || step_f > static_cast<float>(max_step))
+                        {
+                            step_f = static_cast<float>(max_step);
+                        }
+                        if (step_f < 1.0f)
+                        {
+                            step_f = 1.0f;
+                        }
+                        ef_diff = static_cast<int>(step_f);
+                        if (ef_diff < 1)
+                        {
+                            ef_diff = 1;
+                        }
                         int ef = latest_ef + ef_diff;
 
                         if (ef > ef_upper_bound)
@@ -1359,7 +1396,7 @@ namespace hnswdis
                         {
                             sum += stat;
                         }
-                        float agg_recall = sum / recalls.size(); // average recall
+                        float agg_recall = recalls.empty() ? 0.0f : sum / recalls.size(); // average recall
 
                         ef_recall_list.push_back({ef, agg_recall});
 
@@ -1368,7 +1405,7 @@ namespace hnswdis
                         latest_ef = ef;
                         latest_agg_recall = agg_recall;
 
-                        if (recall_diff < 1e-5f && latest_ef >= expected_recall - 1e-3f)
+                        if (recall_diff < 1e-5f && latest_agg_recall >= expected_recall - 1e-3f)
                         {
                             std::cout << "Recall diff is too small, break." << std::endl;
                             break;
