@@ -17,7 +17,7 @@ void print_usage()
         << "                  [--metric l2|cd] [--k 10] [--repeat 3] [--ef-upper 5000]\n"
         << "                  [--ef-min N --ef-step N] [--dataset NAME]\n"
         << "  run_fvecs offline --base BASE.fvecs --index INDEX.hnsw --dataset NAME [--metric l2|cd]\n"
-        << "                    [--k K] [--expected-recall 0.95] [--sampling-size 200] [--ef-upper 5000]\n"
+        << "                    [--k K]... [--expected-recall 0.95] [--sampling-size 200] [--ef-upper 5000]\n"
         << "  run_fvecs ada --query QUERY.fvecs --neighbors GT.ivecs --index INDEX.hnsw --dataset NAME\n"
         << "                [--metric l2|cd] [--k 10] [--repeat 3] [--expected-recall 0.95]\n"
         << "  run_fvecs sweep --query QUERY.fvecs --neighbors GT.ivecs --index INDEX.hnsw\n"
@@ -73,6 +73,7 @@ int main(int argc, char **argv)
     int threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency() / 4));
     int k = 10;
     bool k_set = false;
+    std::vector<int> ks;
     int repeat = 3;
     int ef_upper = 5000;
     bool ef_upper_set = false;
@@ -128,8 +129,17 @@ int main(int argc, char **argv)
                 take_int(threads);
             else if (flag == "--k")
             {
-                take_int(k);
-                k_set = true;
+                int kv;
+                take_int(kv);
+                if (cmd == "offline")
+                {
+                    ks.push_back(kv);
+                }
+                else
+                {
+                    k = kv;
+                    k_set = true;
+                }
             }
             else if (flag == "--repeat")
                 take_int(repeat);
@@ -215,10 +225,10 @@ int main(int argc, char **argv)
             {
                 return 1;
             }
-            std::vector<int> ks = k_set ? std::vector<int>{k} : std::vector<int>{10, 100};
+            std::vector<int> ks_use = ks.empty() ? std::vector<int>{10, 100} : ks;
             Eigen::setNbThreads(std::max(1, threads));
             run_offline_ada(std::filesystem::path(std::getenv("EXPERIMENTS_ROOT")), dataset, base, index_path,
-                            metric, ks, expected_recall, quantile_step, sampling_size, ef_upper);
+                            metric, ks_use, expected_recall, quantile_step, sampling_size, ef_upper);
             return 0;
         }
         if (cmd == "ada")
