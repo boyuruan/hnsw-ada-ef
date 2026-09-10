@@ -6,11 +6,11 @@ project(hnswlib
 include(GNUInstallDirs)
 include(CheckCXXCompilerFlag)
 
-set(EIGEN3_INCLUDE_DIR "/usr/include/eigen3")
+set(EIGEN3_INCLUDE_DIR "/usr/include/eigen3" CACHE STRING "Path to the Eigen include directory")
 add_library(eigen INTERFACE)
 target_include_directories(eigen INTERFACE ${EIGEN3_INCLUDE_DIR})
 
-set(BOOST_ROOT "/usr/include")
+set(BOOST_ROOT "/usr/include" CACHE STRING "Path to the Boost root (headers under <root>/include)")
 add_library(boost INTERFACE)
 target_include_directories(boost INTERFACE ${BOOST_ROOT})
 
