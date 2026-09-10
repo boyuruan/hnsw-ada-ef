@@ -1,0 +1,2 @@
+{"v":1,"type":"begin","id":"2026-09-10-0359-bcfm","ts":"2026-09-10T03:59:22.664Z","outcome":"Build HNSW index over MS MARCO 18M Cohere embeddings","criteria":["run_fvecs build writes a complete index file under /data/byr/hnsw-index/"],"decisions":[],"lane":null}
+{"v":1,"type":"end","id":"2026-09-10-0359-bcfm","ts":"2026-09-10T05:58:10.420Z","status":"completed","dispositions":[{"criterion":1,"met":true}],"note":"run_fvecs build completed: 18M x 768, 6965080 ms, index written","contractHash":"0e1d3726633a88731ae9405e031eb241a27febcaeb17f2119ae41e71cdc859cb"}
