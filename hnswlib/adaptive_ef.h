@@ -798,6 +798,51 @@ namespace hnswdis
         return query_vectors;
     }
 
+    std::pair<std::shared_ptr<hnswdis::MatrixXf>, std::vector<int>> sample_data_with_ids(
+        const hnswdis::MatrixXf &data_vectors, size_t sample_size)
+    {
+        std::mt19937 gen;
+        gen.seed(123456789);
+
+        const int n = static_cast<int>(data_vectors.rows());
+        std::uniform_int_distribution<> dis(0, n - 1);
+        std::unordered_set<int> unique_indices;
+        while (unique_indices.size() < sample_size)
+        {
+            unique_indices.insert(dis(gen));
+        }
+        std::vector<int> indices(unique_indices.begin(), unique_indices.end());
+
+        std::shared_ptr<hnswdis::MatrixXf> query_vectors = std::make_shared<hnswdis::MatrixXf>(sample_size, data_vectors.cols());
+        for (size_t i = 0; i < sample_size; ++i)
+        {
+            query_vectors->row(i) = data_vectors.row(indices[i]);
+        }
+        return {query_vectors, indices};
+    }
+
+    MatrixXi drop_self_neighbors(const MatrixXi &gt_with_self, const std::vector<int> &sample_ids, int k)
+    {
+        MatrixXi gt(gt_with_self.rows(), k);
+        for (int i = 0; i < gt_with_self.rows(); ++i)
+        {
+            int w = 0;
+            for (int j = 0; j < gt_with_self.cols() && w < k; ++j)
+            {
+                if (gt_with_self(i, j) == sample_ids[static_cast<size_t>(i)])
+                {
+                    continue;
+                }
+                gt(i, w++) = gt_with_self(i, j);
+            }
+            if (w < k)
+            {
+                throw std::runtime_error("drop_self_neighbors: fewer than k neighbors after excluding self");
+            }
+        }
+        return gt;
+    }
+
     class RecallEstimator
     {
     private:
@@ -1026,15 +1071,38 @@ namespace hnswdis
         }
     };
 
+    MatrixXi compute_sampling_ground_truth(
+        const MatrixXf &query_vectors,
+        const MatrixXf &data_vectors,
+        const std::string &metric,
+        const int k)
+    {
+        if (metric == "cd")
+        {
+            return compute_ground_truth_batch_parallel4(query_vectors, data_vectors, metric, k);
+        }
+        return compute_ground_truth_batch_parallel3(query_vectors, data_vectors, metric, k);
+    }
+
     std::pair<MatrixXf, MatrixXi> compute_samplings(
         std::shared_ptr<hnswdis::MatrixXf> data_vectors,
         const std::string &metric,
         const int k,
-        const size_t sample_size)
+        const size_t sample_size,
+        bool exclude_self = false)
     {
-        std::shared_ptr<hnswdis::MatrixXf> sample_query_vectors = hnswdis::sample_data(*data_vectors, sample_size);
-        MatrixXi sample_ground_truth = compute_ground_truth_batch_parallel4(*sample_query_vectors, *data_vectors, metric, k);
-        return {*sample_query_vectors, sample_ground_truth};
+        if (!exclude_self)
+        {
+            std::shared_ptr<hnswdis::MatrixXf> sample_query_vectors = hnswdis::sample_data(*data_vectors, sample_size);
+            MatrixXi sample_ground_truth = compute_sampling_ground_truth(*sample_query_vectors, *data_vectors, metric, k);
+            return {*sample_query_vectors, sample_ground_truth};
+        }
+
+        auto sampled = hnswdis::sample_data_with_ids(*data_vectors, sample_size);
+        MatrixXi gt_with_self = compute_sampling_ground_truth(*sampled.first, *data_vectors, metric, k + 1);
+        MatrixXi sample_ground_truth = drop_self_neighbors(gt_with_self, sampled.second, k);
+        std::cout << "Sampling GT excludes self (k=" << k << ", samples=" << sample_size << ")" << std::endl;
+        return {*sampled.first, sample_ground_truth};
     }
 
     void serialize_samplings(const std::string &filename,

@@ -347,6 +347,132 @@ namespace hnswdis
         }
     };
 
+    class SquaredEuclideanDistanceEstimator : public Estimator
+    {
+    private:
+        RowVectorXf squared_means;
+        RowVectorXf squared_variances;
+
+        MatrixXf cov_matrix_2_1;
+        RowVectorXf diag_vec_cov_2_1;
+
+        float sum_squared_means = 0.0f;
+        float sum_squared_variances = 0.0f;
+        float sum_squared_cov_matrix = 0.0f;
+
+        RowVectorXf c_upper_2_1;
+        RowVectorXf c_upper_1_2;
+
+        static void write_vector(std::ostream &out, const RowVectorXf &v)
+        {
+            int size = static_cast<int>(v.size());
+            out.write(reinterpret_cast<const char *>(&size), sizeof(int));
+            out.write(reinterpret_cast<const char *>(v.data()), sizeof(float) * size);
+        }
+
+        static void read_vector(std::istream &in, RowVectorXf &v)
+        {
+            int size = 0;
+            in.read(reinterpret_cast<char *>(&size), sizeof(int));
+            v.resize(size);
+            in.read(reinterpret_cast<char *>(v.data()), sizeof(float) * size);
+        }
+
+        static void write_matrix(std::ostream &out, const MatrixXf &m)
+        {
+            int rows = static_cast<int>(m.rows());
+            int cols = static_cast<int>(m.cols());
+            out.write(reinterpret_cast<const char *>(&rows), sizeof(int));
+            out.write(reinterpret_cast<const char *>(&cols), sizeof(int));
+            out.write(reinterpret_cast<const char *>(m.data()), sizeof(float) * rows * cols);
+        }
+
+        static void read_matrix(std::istream &in, MatrixXf &m)
+        {
+            int rows = 0;
+            int cols = 0;
+            in.read(reinterpret_cast<char *>(&rows), sizeof(int));
+            in.read(reinterpret_cast<char *>(&cols), sizeof(int));
+            m.resize(rows, cols);
+            in.read(reinterpret_cast<char *>(m.data()), sizeof(float) * rows * cols);
+        }
+
+    public:
+        SquaredEuclideanDistanceEstimator() = default;
+
+        SquaredEuclideanDistanceEstimator(const MatrixXf &data_vecs)
+            : Estimator(data_vecs)
+        {
+            MatrixXf squared_data_vecs = data_vecs.array().square();
+            squared_means = compute_mean_parallel(squared_data_vecs);
+            MatrixXf squared_cov_matrix = compute_covariance_matrix2(squared_data_vecs, squared_means);
+            squared_variances = squared_cov_matrix.diagonal();
+
+            cov_matrix_2_1 = compute_cross_covariance_matrix(squared_data_vecs, data_vecs, squared_means, means);
+            diag_vec_cov_2_1 = cov_matrix_2_1.diagonal();
+
+            sum_squared_means = squared_means.sum();
+            sum_squared_variances = squared_variances.sum();
+            sum_squared_cov_matrix = squared_cov_matrix.sum();
+
+            c_upper_2_1 = cov_matrix_2_1.triangularView<Eigen::StrictlyUpper>().toDenseMatrix().colwise().sum();
+            MatrixXf cov_matrix_1_2 = cov_matrix_2_1.transpose();
+            c_upper_1_2 = cov_matrix_1_2.triangularView<Eigen::StrictlyUpper>().toDenseMatrix().rowwise().sum();
+        }
+
+        std::tuple<float, float> get_ideal_distribution(const RowVectorXf &q) const override
+        {
+            RowVectorXf q_squared = q.array().square();
+            float mu = q_squared.sum() + sum_squared_means - 2.0f * q.dot(means);
+            float var = sum_squared_variances + 4.0f * q_squared.dot(variances) - 4.0f * diag_vec_cov_2_1.dot(q);
+            return {mu, var};
+        }
+
+        std::tuple<float, float> get_practical_distribution(const RowVectorXf &q) const override
+        {
+            float mu = q.array().square().sum() + sum_squared_means - 2.0f * q.dot(means);
+            float term1 = sum_squared_cov_matrix;
+            float term2 = 4.0f * (q * covariance_matrix * q.transpose())(0, 0);
+            float term3 = -4.0f * diag_vec_cov_2_1.dot(q);
+            float term4 = -4.0f * c_upper_2_1.dot(q);
+            float term5 = -4.0f * c_upper_1_2.dot(q);
+            return {mu, term1 + term2 + term3 + term4 + term5};
+        }
+
+        std::string get_name() const override
+        {
+            return "SquaredEuclideanDistanceEstimator";
+        }
+
+        void serialize(std::ostream &out) const override
+        {
+            Estimator::serialize(out);
+            write_vector(out, squared_means);
+            write_vector(out, squared_variances);
+            write_matrix(out, cov_matrix_2_1);
+            write_vector(out, diag_vec_cov_2_1);
+            out.write(reinterpret_cast<const char *>(&sum_squared_means), sizeof(float));
+            out.write(reinterpret_cast<const char *>(&sum_squared_variances), sizeof(float));
+            out.write(reinterpret_cast<const char *>(&sum_squared_cov_matrix), sizeof(float));
+            write_vector(out, c_upper_2_1);
+            write_vector(out, c_upper_1_2);
+        }
+
+        void deserialize(std::istream &in) override
+        {
+            Estimator::deserialize(in);
+            read_vector(in, squared_means);
+            read_vector(in, squared_variances);
+            read_matrix(in, cov_matrix_2_1);
+            read_vector(in, diag_vec_cov_2_1);
+            in.read(reinterpret_cast<char *>(&sum_squared_means), sizeof(float));
+            in.read(reinterpret_cast<char *>(&sum_squared_variances), sizeof(float));
+            in.read(reinterpret_cast<char *>(&sum_squared_cov_matrix), sizeof(float));
+            read_vector(in, c_upper_2_1);
+            read_vector(in, c_upper_1_2);
+        }
+    };
+
     void save_estimator_to_file(const Estimator &estimator, const std::string &filename)
     {
         std::ofstream out(filename, std::ios::binary);
@@ -389,6 +515,10 @@ namespace hnswdis
         else if (type == "CosineDistanceEstimator")
         {
             estimator = std::make_shared<CosineDistanceEstimator>();
+        }
+        else if (type == "SquaredEuclideanDistanceEstimator")
+        {
+            estimator = std::make_shared<SquaredEuclideanDistanceEstimator>();
         }
         else
         {
@@ -697,6 +827,11 @@ namespace hnswdis
             estimator = std::make_shared<hnswdis::InnerProductEstimator>(data_vectors);
             std::cout << "InnerProductEstimator created" << std::endl;
         }
+        else if (metric == "l2")
+        {
+            estimator = std::make_shared<hnswdis::SquaredEuclideanDistanceEstimator>(data_vectors);
+            std::cout << "SquaredEuclideanDistanceEstimator created" << std::endl;
+        }
         else
         {
             std::cerr << "Invalid metric: " << metric << std::endl;
@@ -704,71 +839,4 @@ namespace hnswdis
         }
         return estimator;
     };
-
-    // SquaredEuclideanDistanceEstimator
-    // class SquaredEuclideanDistanceEstimator : public Estimator
-    // {
-    // private:
-    //     RowVectorXf squared_means;
-    //     RowVectorXf squared_variances;
-
-    //     MatrixXf cov_matrix_2_1;
-    //     MatrixXf cov_matrix_1_2;
-    //     RowVectorXf diag_vec_cov_2_1;
-
-    //     float sum_squared_means;
-    //     float sum_squared_variances;
-    //     float sum_squared_cov_matrix;
-
-    //     RowVectorXf c_upper_2_1; // 1 x n
-    //     RowVectorXf c_upper_1_2; // n x 1
-
-    // public:
-    //     SquaredEuclideanDistanceEstimator(const MatrixXf &data_vecs)
-    //         : Estimator(data_vecs)
-    //     {
-    //         MatrixXf squared_data_vecs = data_vecs.array().square();
-    //         squared_means = squared_data_vecs.colwise().mean();
-    //         MatrixXf squared_cov_matrix = compute_covariance_matrix(squared_data_vecs, squared_means);
-    //         squared_variances = squared_cov_matrix.diagonal();
-
-    //         cov_matrix_2_1 = compute_cross_covariance_matrix(squared_data_vecs, data_vecs, squared_means, means);
-    //         cov_matrix_1_2 = cov_matrix_2_1.transpose();
-    //         diag_vec_cov_2_1 = cov_matrix_2_1.diagonal();
-
-    //         sum_squared_means = squared_means.sum();
-    //         sum_squared_variances = squared_variances.sum();
-    //         sum_squared_cov_matrix = squared_cov_matrix.sum();
-
-    //         c_upper_2_1 = cov_matrix_2_1.triangularView<Eigen::StrictlyUpper>().toDenseMatrix().colwise().sum();
-    //         c_upper_1_2 = cov_matrix_1_2.triangularView<Eigen::StrictlyUpper>().toDenseMatrix().rowwise().sum();
-    //     }
-
-    //     std::tuple<float, float> get_ideal_distribution(const RowVectorXf &q) const override
-    //     {
-    //         RowVectorXf q_squared = q.array().square();
-    //         float mu = q_squared.sum() + sum_squared_means - 2.0 * q.dot(means);
-    //         float var = sum_squared_variances + 4.0 * q_squared.dot(variances) - 4.0 * diag_vec_cov_2_1.dot(q);
-
-    //         return {mu, var};
-    //     }
-
-    //     std::tuple<float, float> get_practical_distribution(const RowVectorXf &q) const override
-    //     {
-    //         float mu = q.array().square().sum() + sum_squared_means - 2.0 * q.dot(means);
-
-    //         float term1 = sum_squared_cov_matrix;
-    //         float term2 = 4 * (q * covariance_matrix * q.transpose())(0, 0);
-    //         float term3 = -4.0 * diag_vec_cov_2_1.dot(q);
-
-    //         float term4 = -4.0 * c_upper_2_1.dot(q);
-    //         float term5 = -4.0 * c_upper_1_2.dot(q);
-
-    //         return {mu, term1 + term2 + term3 + term4 + term5};
-    //     }
-    //     std::string get_name() const override
-    //     {
-    //         return "SquaredEuclideanDistanceEstimator";
-    //     }
-    // };
 }

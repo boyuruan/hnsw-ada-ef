@@ -12,6 +12,13 @@ void print_usage()
     std::cerr
         << "Usage:\n"
         << "  run_fvecs build --base BASE.fvecs --index OUT.hnsw [--metric l2|cd] [--M 16] [--efc 500] [--threads N]\n"
+        << "  run_fvecs bench --query QUERY.fvecs --neighbors GT.ivecs --index INDEX.hnsw\n"
+        << "                  [--metric l2|cd] [--k 10] [--repeat 3] [--ef-upper 5000]\n"
+        << "                  [--ef-min N --ef-step N] [--dataset NAME]\n"
+        << "  run_fvecs offline --base BASE.fvecs --index INDEX.hnsw --dataset NAME [--metric l2|cd]\n"
+        << "                    [--k K] [--expected-recall 0.95] [--sampling-size 200] [--ef-upper 5000]\n"
+        << "  run_fvecs ada --query QUERY.fvecs --neighbors GT.ivecs --index INDEX.hnsw --dataset NAME\n"
+        << "                [--metric l2|cd] [--k 10] [--repeat 3] [--expected-recall 0.95]\n"
         << "  run_fvecs online --base BASE.fvecs --query QUERY.fvecs --neighbors GT.ivecs --index INDEX.hnsw\n"
         << "                   --dataset NAME [--metric l2|cd] [--k 100] [--quantile-step 1e-3]\n";
 }
@@ -60,8 +67,15 @@ int main(int argc, char **argv)
     int M = 16;
     int efc = 500;
     int threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency() / 4));
-    int k = 100;
+    int k = 10;
+    bool k_set = false;
+    int repeat = 3;
+    int ef_upper = 5000;
+    int ef_min = 0;
+    int ef_step = 0;
+    int sampling_size = 200;
     float quantile_step = 1e-3f;
+    float expected_recall = 0.95f;
 
     try
     {
@@ -108,9 +122,24 @@ int main(int argc, char **argv)
             else if (flag == "--threads")
                 take_int(threads);
             else if (flag == "--k")
+            {
                 take_int(k);
+                k_set = true;
+            }
+            else if (flag == "--repeat")
+                take_int(repeat);
+            else if (flag == "--ef-upper")
+                take_int(ef_upper);
+            else if (flag == "--ef-min")
+                take_int(ef_min);
+            else if (flag == "--ef-step")
+                take_int(ef_step);
+            else if (flag == "--sampling-size")
+                take_int(sampling_size);
             else if (flag == "--quantile-step")
                 take_float(quantile_step);
+            else if (flag == "--expected-recall")
+                take_float(expected_recall);
             else
             {
                 std::cerr << "Unknown flag: " << flag << std::endl;
@@ -126,6 +155,91 @@ int main(int argc, char **argv)
                 return 1;
             }
             build_index_from_fvecs(base, index_path, M, efc, metric, threads);
+            return 0;
+        }
+        if (cmd == "bench")
+        {
+            if (!require_flag("--query", query) || !require_flag("--neighbors", neighbors) ||
+                !require_flag("--index", index_path))
+            {
+                return 1;
+            }
+            if (dataset.empty())
+            {
+                dataset = "hnsw";
+            }
+            auto loaded = load_index_query_gt(query, neighbors, index_path, metric);
+            auto hnsw = std::get<0>(loaded);
+            auto query_mat = std::get<1>(loaded);
+            auto gt = std::get<2>(loaded);
+            auto space = std::get<3>(loaded);
+            (void)space;
+            if (k > gt->cols())
+            {
+                throw std::runtime_error("k is larger than ground-truth width");
+            }
+            std::cout << "Default HNSW search (no Ada-ef), k=" << k << ", repeat=" << repeat << std::endl;
+            if (ef_min > 0)
+            {
+                if (ef_step <= 0)
+                {
+                    throw std::runtime_error("--ef-min requires --ef-step");
+                }
+                baseline_search_range(dataset, repeat, *hnsw, *query_mat, *gt, static_cast<size_t>(k),
+                                      static_cast<size_t>(ef_min), static_cast<size_t>(ef_upper),
+                                      static_cast<size_t>(ef_step));
+            }
+            else
+            {
+                baseline_search(dataset, repeat, *hnsw, *query_mat, *gt, static_cast<size_t>(k),
+                                static_cast<size_t>(ef_upper));
+            }
+            return 0;
+        }
+        if (cmd == "offline")
+        {
+            if (!require_flag("--base", base) || !require_flag("--index", index_path) ||
+                !require_flag("--dataset", dataset))
+            {
+                return 1;
+            }
+            if (require_experiments_root() != 0)
+            {
+                return 1;
+            }
+            std::vector<int> ks = k_set ? std::vector<int>{k} : std::vector<int>{10, 100};
+            Eigen::setNbThreads(std::max(1, threads));
+            run_offline_ada(std::filesystem::path(std::getenv("EXPERIMENTS_ROOT")), dataset, base, index_path,
+                            metric, ks, expected_recall, quantile_step, sampling_size, ef_upper);
+            return 0;
+        }
+        if (cmd == "ada")
+        {
+            if (!require_flag("--query", query) || !require_flag("--neighbors", neighbors) ||
+                !require_flag("--index", index_path) || !require_flag("--dataset", dataset))
+            {
+                return 1;
+            }
+            if (require_experiments_root() != 0)
+            {
+                return 1;
+            }
+            auto loaded = load_index_query_gt(query, neighbors, index_path, metric);
+            auto hnsw = std::get<0>(loaded);
+            auto query_mat = std::get<1>(loaded);
+            auto gt = std::get<2>(loaded);
+            auto space = std::get<3>(loaded);
+            (void)space;
+            if (k > gt->cols())
+            {
+                throw std::runtime_error("k is larger than ground-truth width");
+            }
+            hnswdis::MatrixXf dummy_data(0, query_mat->cols());
+            auto dummy_ptr = std::make_shared<hnswdis::MatrixXf>(dummy_data);
+            std::cout << "Ada-ef search, k=" << k << ", expected_recall=" << expected_recall
+                      << ", repeat=" << repeat << std::endl;
+            run_online_search(std::filesystem::path(std::getenv("EXPERIMENTS_ROOT")), dataset, quantile_step, k,
+                              hnsw, query_mat, dummy_ptr, gt, repeat, expected_recall, true);
             return 0;
         }
         if (cmd == "online")

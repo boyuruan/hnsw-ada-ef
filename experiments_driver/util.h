@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <queue>
 #include <stdexcept>
+#include <vector>
 
 void load_fvecs(const std::string &path, hnswdis::MatrixXf &vectors)
 {
@@ -156,6 +157,50 @@ load_index_and_data_fvecs(
     std::cout << "Data size of space:" << space->get_data_size() << std::endl;
 
     return std::make_tuple(alg_hnsw, query_vectors_ptr, data_vectors_ptr, neighbors_ptr, space);
+}
+
+std::tuple<
+    std::shared_ptr<hnswlib::HierarchicalNSW<float>>,
+    std::shared_ptr<hnswdis::MatrixXf>,
+    std::shared_ptr<hnswdis::MatrixXi>,
+    std::shared_ptr<hnswlib::SpaceInterface<float>>>
+load_index_query_gt(
+    const std::string &query_path,
+    const std::string &neighbors_path,
+    const std::string &index_path,
+    const std::string &metric)
+{
+    auto query_vectors_ptr = std::make_shared<hnswdis::MatrixXf>();
+    auto neighbors_ptr = std::make_shared<hnswdis::MatrixXi>();
+
+    load_fvecs(query_path, *query_vectors_ptr);
+    load_ivecs(neighbors_path, *neighbors_ptr);
+
+    if (query_vectors_ptr->rows() != neighbors_ptr->rows())
+    {
+        throw std::runtime_error("Query count does not match neighbors count");
+    }
+    if (neighbors_ptr->cols() <= 0)
+    {
+        throw std::runtime_error("Ground truth has no neighbor columns");
+    }
+
+    if (metric == "cd")
+    {
+        std::cout << "Normalize the query vectors" << std::endl;
+        normalize_matrix(*query_vectors_ptr);
+    }
+
+    std::cout << "Query vectors dimensions: " << query_vectors_ptr->rows() << " x " << query_vectors_ptr->cols() << std::endl;
+    std::cout << "Neighbors dimensions: " << neighbors_ptr->rows() << " x " << neighbors_ptr->cols() << std::endl;
+
+    std::shared_ptr<hnswlib::SpaceInterface<float>> space =
+        hnswdis::init_space(metric, query_vectors_ptr->cols());
+    std::shared_ptr<hnswlib::HierarchicalNSW<float>> alg_hnsw =
+        std::make_shared<hnswlib::HierarchicalNSW<float>>(space.get(), index_path);
+
+    std::cout << "Index loaded, n=" << alg_hnsw->cur_element_count.load() << std::endl;
+    return std::make_tuple(alg_hnsw, query_vectors_ptr, neighbors_ptr, space);
 }
 
 void print_score_distribution(const std::vector<float> &score_list)
@@ -603,6 +648,119 @@ void baseline_search(
     std::cout << "Experiment finished" << std::endl;
 }
 
+void baseline_search_range(
+    const std::string &dataset,
+    const int repeat,
+    hnswlib::HierarchicalNSW<float> &hnsw,
+    const hnswdis::MatrixXf &query_vectors,
+    const hnswdis::MatrixXi &ground_truth,
+    const size_t k,
+    const size_t ef_min,
+    const size_t ef_max,
+    const size_t ef_step)
+{
+    if (ef_min == 0 || ef_step == 0 || ef_min > ef_max)
+    {
+        throw std::runtime_error("invalid ef range: need 0 < ef-min <= ef-max and ef-step > 0");
+    }
+
+    std::vector<std::tuple<size_t, size_t, float, float, float, int, int, int>> exp_results;
+    for (size_t ef = ef_min; ef <= ef_max; ef += ef_step)
+    {
+        std::tuple<size_t, size_t, float, float, float, int, int, int> exp_record =
+            std::make_tuple(ef, 0, 0.0f, 0.0f, 0.0f, 0, 0, 0);
+
+        std::cout << "ef: " << ef << std::endl;
+        hnsw.setEf(ef);
+
+        std::vector<int64_t> hnsw_search_time;
+        hnsw_search_time.reserve(repeat);
+        std::vector<float> recalls;
+        for (int i = 0; i < repeat; ++i)
+        {
+            std::vector<std::vector<size_t>> result;
+            result.reserve(query_vectors.rows());
+            auto start_time = std::chrono::high_resolution_clock::now();
+            for (int q = 0; q < query_vectors.rows(); q++)
+            {
+                auto ret = hnsw.searchKnn(query_vectors.row(q).data(), k);
+                size_t count = ret.size();
+                std::vector<size_t> labels(count);
+                while (!ret.empty())
+                {
+                    labels[--count] = ret.top().second;
+                    ret.pop();
+                }
+                result.push_back(std::move(labels));
+            }
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+            hnsw_search_time.push_back(duration.count());
+
+            if (i == repeat - 1)
+            {
+                recalls = hnswdis::compute_recall(ground_truth, result, k, false);
+            }
+        }
+
+        float avg_recall = std::accumulate(recalls.begin(), recalls.end(), 0.0) / recalls.size();
+        std::cout << "Average Recall: " << avg_recall << std::endl;
+        std::sort(recalls.begin(), recalls.end());
+        size_t index_5 = static_cast<size_t>(recalls.size() * 0.05);
+        size_t index_1 = static_cast<size_t>(recalls.size() * 0.01);
+        float percentile_5 = recalls[index_5];
+        float percentile_1 = recalls[index_1];
+        std::cout << "5th percentile recall: " << percentile_5 << std::endl;
+        std::cout << "1st percentile recall: " << percentile_1 << std::endl;
+
+        int count_high_recall_99 = 0, count_high_recall_95 = 0, count_high_recall_90 = 0;
+        for (const auto &recall : recalls)
+        {
+            if (recall >= 0.99)
+                count_high_recall_99++;
+            if (recall >= 0.95)
+                count_high_recall_95++;
+            if (recall >= 0.90)
+                count_high_recall_90++;
+        }
+
+        std::sort(hnsw_search_time.begin(), hnsw_search_time.end());
+        int64_t median_time = hnsw_search_time[hnsw_search_time.size() / 2];
+        std::cout << "Median search time: " << median_time << " ms" << std::endl;
+        std::cout << "Search times: ";
+        for (const auto &t : hnsw_search_time)
+        {
+            std::cout << t << " ms, ";
+        }
+        std::cout << std::endl;
+
+        std::get<0>(exp_record) = ef;
+        std::get<1>(exp_record) = median_time;
+        std::get<2>(exp_record) = avg_recall;
+        std::get<3>(exp_record) = percentile_5;
+        std::get<4>(exp_record) = percentile_1;
+        std::get<5>(exp_record) = count_high_recall_99;
+        std::get<6>(exp_record) = count_high_recall_95;
+        std::get<7>(exp_record) = count_high_recall_90;
+        exp_results.push_back(exp_record);
+    }
+
+    std::cout << dataset << " experiment results:" << std::endl;
+    std::cout << "ef, time, avg_recall, 5th_percentile_recall, 1st_percentile_recall, recall_above_99, recall_above_95, recall_above_90" << std::endl;
+    for (const auto &result : exp_results)
+    {
+        std::cout << std::get<0>(result) << ", "
+                  << std::get<1>(result) << ", "
+                  << std::get<2>(result) << ", "
+                  << std::get<3>(result) << ", "
+                  << std::get<4>(result) << ", "
+                  << std::get<5>(result) << ", "
+                  << std::get<6>(result) << ", "
+                  << std::get<7>(result) << std::endl;
+    }
+    std::cout << "Experiment finished" << std::endl;
+}
+
 void search_with_patience_in_proximity(
     const std::string &dataset,
     const int repeat,
@@ -730,12 +888,11 @@ void run_online_search(
     std::shared_ptr<hnswlib::HierarchicalNSW<float>> hnsw,
     std::shared_ptr<hnswdis::MatrixXf> query,
     std::shared_ptr<hnswdis::MatrixXf> data,
-    std::shared_ptr<hnswdis::MatrixXi> ground_truth)
+    std::shared_ptr<hnswdis::MatrixXi> ground_truth,
+    int repeat = 1,
+    float expected_recall = 0.95f,
+    bool ada_only = false)
 {
-    float expected_recall = 0.95;
-    int ef_upper_bound = 5000;
-    int repeat = 1;
-
     std::string ef_adaptor_path = (root / "estimation_table" / (dataset + "-ef_adaptor-" + "-k" + std::to_string(k) + "-ef.bin")).string();
     std::string estimator_path = (root / "statistics" / (dataset + "-estimator-" + "-k-" + std::to_string(k) + ".bin")).string();
 
@@ -769,9 +926,75 @@ void run_online_search(
     size_t statics_length = 1 + 32 + 31 * 32; // 2-hop neighbors on the base layer: M = 16
     hnsw->setEf(wae);
     adaptive_search(dataset, repeat, *hnsw, *query, *data, *ground_truth, score_cal, k, sketch, statics_length, expected_recall);
+    if (ada_only)
+    {
+        return;
+    }
     adaptive_ef_analysis(dataset, *hnsw, *query, score_cal, k, sketch, statics_length);
 
     search_with_patience_in_proximity(dataset, repeat, *hnsw, *query, *ground_truth, k);
-    baseline_search(dataset, repeat, *hnsw, *query, *ground_truth, k, ef_upper_bound);
+    baseline_search(dataset, repeat, *hnsw, *query, *ground_truth, k, 5000);
+}
+
+void run_offline_ada(
+    const std::filesystem::path &root,
+    const std::string &dataset,
+    const std::string &base_path,
+    const std::string &index_path,
+    const std::string &metric,
+    const std::vector<int> &ks,
+    float expected_recall,
+    float quantile_step,
+    int sampling_size,
+    int ef_upper_bound)
+{
+    std::filesystem::create_directories(root / "estimation_table");
+    std::filesystem::create_directories(root / "sampling");
+    std::filesystem::create_directories(root / "statistics");
+
+    hnswdis::MatrixXf data_vectors;
+    load_fvecs(base_path, data_vectors);
+    if (metric == "cd")
+    {
+        std::cout << "Normalize the data vectors" << std::endl;
+        normalize_matrix(data_vectors);
+    }
+    auto data = std::make_shared<hnswdis::MatrixXf>(std::move(data_vectors));
+
+    auto space = hnswdis::init_space(metric, data->cols());
+    auto hnsw = std::make_shared<hnswlib::HierarchicalNSW<float>>(space.get(), index_path);
+    std::cout << "Index loaded, n=" << hnsw->cur_element_count.load() << std::endl;
+
+    size_t statics_length = 1 + 32 + 31 * 32;
+    int max_k = *std::max_element(ks.begin(), ks.end());
+
+    auto estimator = hnswdis::init_estimator(metric, *data);
+    for (int k : ks)
+    {
+        auto estimator_path = (root / "statistics" / (dataset + "-estimator-" + "-k-" + std::to_string(k) + ".bin")).string();
+        hnswdis::save_estimator_to_file(*estimator, estimator_path);
+        std::cout << "Wrote estimator " << estimator_path << std::endl;
+    }
+
+    auto sampling_pair = hnswdis::compute_samplings(data, metric, max_k, static_cast<size_t>(sampling_size), true);
+    for (int k : ks)
+    {
+        auto samplings_path = (root / "sampling" / (dataset + "-samplings-" + "-k" + std::to_string(k) + "-ef.bin")).string();
+        hnswdis::MatrixXi gt_k = sampling_pair.second.leftCols(k);
+        hnswdis::serialize_samplings(samplings_path, sampling_pair.first, gt_k);
+        std::cout << "Wrote samplings " << samplings_path << std::endl;
+    }
+
+    for (int k : ks)
+    {
+        auto samplings_path = (root / "sampling" / (dataset + "-samplings-" + "-k" + std::to_string(k) + "-ef.bin")).string();
+        auto estimator_path = (root / "statistics" / (dataset + "-estimator-" + "-k-" + std::to_string(k) + ".bin")).string();
+        auto ef_adaptor_path = (root / "estimation_table" / (dataset + "-ef_adaptor-" + "-k" + std::to_string(k) + "-ef.bin")).string();
+        std::cout << "Computing ef adaptor for k=" << k << std::endl;
+        hnswdis::EfAdapter ef_adapter(hnsw, data, static_cast<size_t>(k), metric, expected_recall, quantile_step,
+                                      statics_length, samplings_path, estimator_path, ef_upper_bound);
+        ef_adapter.serialize(ef_adaptor_path);
+        std::cout << "Wrote ef adaptor " << ef_adaptor_path << " wae=" << ef_adapter.get_wae() << std::endl;
+    }
 }
 
